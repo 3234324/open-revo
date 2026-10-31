@@ -71,6 +71,15 @@ fn handle_wake_auto_office() {
 
 fn handle_system_resume_pipeline(event_name: &str) {
     crate::system::telemetry::set_screen_suspended(false);
+
+    // Self-heal (both branches): GPU gamma LUT frequently does not survive
+    // suspend cycles. Re-apply enabled per-monitor calibration profiles after
+    // display_tuning presets settle (they re-assert at 500ms; LUT follows at 1200ms).
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_millis(1200));
+        crate::system::color_calibration::reapply_enabled_profiles_on_boot();
+    });
+
     if crate::hal::platform_probe::is_ultrabook() {
         println!("[Power Guard] Ultrabook {}! Restoring power mode only.", event_name);
         handle_wake_auto_office();
@@ -97,6 +106,14 @@ fn handle_system_resume_pipeline(event_name: &str) {
     });
 
     let cfg = crate::system::config::load_config();
+
+    // Self-heal (gaming chassis): MiniLED EC state may reset across suspend
+    // cycles on some chassis. Config stays the source of truth.
+    if cfg.miniled_enabled && crate::commands::display_cmd::is_miniled_supported_hw() {
+        let dispatched = crate::commands::display_cmd::dispatch_miniled_raw(true);
+        println!("[Power Guard] Resume self-heal: MiniLED local dimming re-asserted: {}", dispatched);
+    }
+
     if let Some(ec) = GLOBAL_EC.read().clone() {
         let cfg_limit = cfg.battery_limit;
         let cfg_override = cfg.battery_hardware_limit_enabled;

@@ -1144,6 +1144,54 @@ pub fn init_color_calibration() {
     ensure_standard_profiles_deployed();
 }
 
+/// Self-heal: re-apply enabled per-monitor calibration LUTs after boot / resume.
+///
+/// The GPU gamma ramp is physically volatile - Windows clears it on reboot and
+/// display mode changes, and the stock Calibration Loader does not reliably
+/// restore VCGT curves in all multi-monitor / timing scenarios. This walks the
+/// persisted config and re-writes the hardware ramp for every monitor the user
+/// explicitly enabled, plus re-asserts the Windows profile association.
+///
+/// Safety properties:
+/// - Config remains the single source of truth (apply_profile_for_device only
+///   re-persists identical values; user settings are never altered here).
+/// - Skipped entirely while HDR (Advanced Color) is active: Windows owns the
+///   ramp in that mode and hard-writing the SDR ramp is pointless/flickery.
+/// - Idempotent: writing an identical ramp causes no visual change, so running
+///   after the Calibration Loader already succeeded is harmless.
+pub fn reapply_enabled_profiles_on_boot() {
+    if is_hdr_active() {
+        crate::log_info!("COLOR_CALIB", "HDR is active - skipping LUT self-heal (ramp is owned by Windows Advanced Color)");
+        return;
+    }
+    let cfg = load_calibration_config();
+    let monitors = crate::system::display::get_all_monitors();
+    let mut applied = 0usize;
+    for mon in &monitors {
+        if let Some(setting) = cfg.monitors.get(&mon.device_name) {
+            if setting.enabled && setting.selected_profile_id != "default_native" {
+                match apply_profile_for_device(&mon.device_name, &setting.selected_profile_id) {
+                    Ok(_) => {
+                        applied += 1;
+                        crate::log_info!(
+                            "COLOR_CALIB",
+                            "Self-heal re-applied profile '{}' on {}",
+                            setting.selected_profile_id,
+                            mon.device_name
+                        );
+                    }
+                    Err(e) => {
+                        crate::log_warn!("COLOR_CALIB", "Self-heal failed on {}: {}", mon.device_name, e);
+                    }
+                }
+            }
+        }
+    }
+    if applied == 0 {
+        crate::log_info!("COLOR_CALIB", "Self-heal: no enabled per-monitor calibration to restore");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

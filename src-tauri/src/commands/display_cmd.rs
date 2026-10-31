@@ -249,22 +249,60 @@ pub async fn delete_custom_color_profile(profile_id: String, device_name: Option
     .map_err(|e| e.to_string())?
 }
 
+// ---------------------------------------------------------------------------
+// MiniLED self-heal primitives (usable outside the IPC boundary)
+// ---------------------------------------------------------------------------
+// These two plain functions exist so the boot restore thread and the resume
+// pipeline can re-assert the volatile MiniLED EC state without going through
+// a tauri command (no AppHandle available there). The async commands below
+// are thin wrappers that additionally persist the user preference to config.
+
+/// Probe whether this chassis exposes MiniLED local dimming support (vault EC symbol).
+pub fn is_miniled_supported_hw() -> bool {
+    if let Some(val) = crate::driver::wmi_ec::raw_driver_read_ec(crate::hal::vault::ec::ADDR_LOCAL_DIMMING_SUPPORT) {
+        let is_supported = val != 0xFF && (val & crate::hal::vault::mask::MASK_LOCAL_DIMMING_SUPPORT) != 0;
+        if is_supported {
+            return true;
+        }
+    }
+    if let Some(val) = crate::driver::wmi_mulong::mulong_read_ec(crate::hal::vault::ec::ADDR_LOCAL_DIMMING_SUPPORT) {
+        let is_supported = val != 0xFF && (val & crate::hal::vault::mask::MASK_LOCAL_DIMMING_SUPPORT) != 0;
+        return is_supported;
+    }
+    false
+}
+
+/// Dispatch the MiniLED local dimming toggle to hardware (native COM + CIM fallback),
+/// syncing the OEM registry for control-center UI coherence.
+/// Does NOT touch OpenRevo config - callers decide whether config is the source of truth.
+pub fn dispatch_miniled_raw(enabled: bool) -> bool {
+    let cmd = if enabled {
+        crate::hal::vault::miniled::CMD_MINILED_ON
+    } else {
+        crate::hal::vault::miniled::CMD_MINILED_OFF
+    };
+
+    let mut ok = crate::driver::wmi_mulong::mulong_exec_raw(cmd);
+    if !ok {
+        crate::log_info!("MINILED", "Native COM mulong_exec_raw returned false, running resilient CIM fallback...");
+        ok = execute_miniled_cmd_fallback(cmd);
+    }
+
+    if ok {
+        // Sync with OEM registry so official control center UI stays coherent
+        write_oem_miniled_registry(enabled);
+        crate::log_info!("MINILED", "MiniLED local dimming dispatched to: {}", enabled);
+    } else {
+        crate::log_warn!("MINILED", "Failed to dispatch MiniLED local dimming command via ACPI-WMI");
+    }
+    ok
+}
+
 #[tauri::command]
 pub async fn get_miniled_support() -> Result<bool, String> {
-    tauri::async_runtime::spawn_blocking(|| {
-        // Query hardware capability via vault EC symbol
-        if let Some(val) = crate::driver::wmi_ec::raw_driver_read_ec(crate::hal::vault::ec::ADDR_LOCAL_DIMMING_SUPPORT) {
-            let is_supported = val != 0xFF && (val & crate::hal::vault::mask::MASK_LOCAL_DIMMING_SUPPORT) != 0;
-            return Ok(is_supported);
-        }
-        if let Some(val) = crate::driver::wmi_mulong::mulong_read_ec(crate::hal::vault::ec::ADDR_LOCAL_DIMMING_SUPPORT) {
-            let is_supported = val != 0xFF && (val & crate::hal::vault::mask::MASK_LOCAL_DIMMING_SUPPORT) != 0;
-            return Ok(is_supported);
-        }
-        Ok(false)
-    })
-    .await
-    .map_err(|e| e.to_string())?
+    tauri::async_runtime::spawn_blocking(is_miniled_supported_hw)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 fn read_oem_miniled_registry() -> Option<bool> {
@@ -373,30 +411,14 @@ pub fn get_miniled_status() -> Result<bool, String> {
 #[tauri::command]
 pub async fn set_miniled_status(enabled: bool) -> Result<bool, String> {
     tauri::async_runtime::spawn_blocking(move || {
-        let cmd = if enabled {
-            crate::hal::vault::miniled::CMD_MINILED_ON
-        } else {
-            crate::hal::vault::miniled::CMD_MINILED_OFF
-        };
-
-        let mut ok = crate::driver::wmi_mulong::mulong_exec_raw(cmd);
-        if !ok {
-            crate::log_info!("MINILED", "Native COM mulong_exec_raw returned false, running resilient CIM fallback...");
-            ok = execute_miniled_cmd_fallback(cmd);
-        }
+        let ok = dispatch_miniled_raw(enabled);
 
         if ok {
             let mut cfg = crate::system::config::load_config();
             cfg.miniled_enabled = enabled;
             crate::system::config::save_config(&cfg);
-
-            // Sync with OEM registry so official control center UI stays coherent
-            write_oem_miniled_registry(enabled);
-
-            crate::log_info!("MINILED", "MiniLED local dimming toggled to: {}", enabled);
             Ok(enabled)
         } else {
-            crate::log_warn!("MINILED", "Failed to dispatch MiniLED local dimming command via ACPI-WMI");
             Err("Failed to dispatch MiniLED command to ACPI-WMI bridge".to_string())
         }
     })

@@ -218,6 +218,26 @@ pub fn spawn_hardware_state_restore(ec_for_restore: crate::driver::ec_bridge::Sh
             return;
         }
 
+        // Self-heal: MiniLED local dimming lives in volatile EC state that resets
+        // on every power cycle. Re-assert the user's persisted preference right
+        // away; config is the source of truth, so nothing is written back here.
+        if cfg.miniled_enabled && crate::commands::display_cmd::is_miniled_supported_hw() {
+            let dispatched = crate::commands::display_cmd::dispatch_miniled_raw(true);
+            crate::log_info!(
+                "POWER_RESTORE",
+                "Startup self-heal: MiniLED local dimming re-asserted: {}",
+                dispatched
+            );
+        }
+
+        // Self-heal: GPU gamma LUT is volatile (cleared by reboot / display mode
+        // change). Delayed re-apply so display drivers and the Windows
+        // Calibration Loader settle first, mirroring the battery debounce pattern.
+        std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(3000));
+            crate::system::color_calibration::reapply_enabled_profiles_on_boot();
+        });
+
         // If OEM service is not running or takeover is active, restore all hardware state:
         let mut is_dc_online = crate::commands::hardware_cmd::is_dc_round_plugged_in();
         // 启动初期电源状态防抖：若首次读取为 false，等待 250ms 重试一次，过滤开机登录阶段驱动瞬态未决
